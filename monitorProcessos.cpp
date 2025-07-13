@@ -1,126 +1,166 @@
 #include <iostream>
-#include <fstream>      // Para leitura de arquivos (ifstream)
+#include <fstream>
 #include <string>
 #include <vector>
-#include <dirent.h>     // Para navegar em diretórios (opendir, readdir)
-#include <csignal>      // Para a função kill()
-#include <algorithm>    // Para std::all_of
-#include <iomanip>      // Para formatação da saída (setw)
-#include <limits>       // Para limpar o buffer de entrada
-#include <cstring>      // Para strcmp
+#include <dirent.h>     // Para listar diretórios (/proc)
+#include <csignal>      // Para enviar sinais (kill)
+#include <unistd.h>     // Para sysconf, access, sleep
+#include <sys/types.h>
+#include <sstream>      // Para manipulação de strings
+#include <iomanip>      // Para formatação da saída
+#include <algorithm>
+#include <cerrno>       // Para capturar códigos de erro
+#include <cstring>      // Para a função strerror
 
-void listarProcessos() {
-    const char* proc_dir = "/proc";
-    DIR* dir = opendir(proc_dir);
-    if (dir == nullptr) {
-        perror("Erro ao abrir o diretorio /proc");
-        return;
+struct Processo {
+    int pid;
+    std::string nome;
+    float memoriaKB;
+    float tempoCPU_s; // Tempo de CPU consumido em segundos
+};
+
+Processo obterDadosProcesso(int pid) {
+    Processo p = {pid, "", 0.0, 0.0};
+
+    // 1. Obter nome do processo de /proc/[pid]/comm
+    std::ifstream comm_file("/proc/" + std::to_string(pid) + "/comm");
+    if (comm_file.good()) {
+        std::getline(comm_file, p.nome);
     }
-    std::cout << "\n------------------------------------------------------------------" << std::endl;
-    std::cout << std::left << std::setw(10) << "PID"
-              << std::left << std::setw(40) << "Nome do Executavel"
-              << std::left << std::setw(15) << "Memoria (MB)" << std::endl;
-    std::cout << "------------------------------------------------------------------" << std::endl;
 
-    struct dirent* entry;
-    // Itera sobre todas as entradas do diretório /proc
-    while ((entry = readdir(dir)) != nullptr) {
-        // Verifica se o nome da entrada é composto apenas por dígitos (um PID)
-        if (entry->d_type == DT_DIR) {
-            char* endptr;
-            long pid = strtol(entry->d_name, &endptr, 10);
-            if (*endptr == '\0') { // Conversão para número foi bem-sucedida
-                std::string status_path = std::string(proc_dir) + "/" + entry->d_name + "/status";
-                std::ifstream status_file(status_path);
-
-                if (status_file) {
-                    std::string line;
-                    std::string nome;
-                    double memoria_kb = 0.0;
-
-                    // Lê o arquivo /proc/[pid]/status linha por linha
-                    while (std::getline(status_file, line)) {
-                        if (line.rfind("Name:", 0) == 0) {
-                            nome = line.substr(6); // Pega a substring após "Name:"
-                            nome.erase(0, nome.find_first_not_of(" \t")); // Remove espaços em branco
-                        } else if (line.rfind("VmRSS:", 0) == 0) {
-                            // VmRSS é o "Resident Set Size", memória física (RAM) usada.
-                            memoria_kb = std::stod(line.substr(7));
-                        }
-                    }
-
-                    std::cout << std::left << std::setw(10) << pid
-                              << std::left << std::setw(40) << nome
-                              << std::left << std::setw(15) << std::fixed << std::setprecision(2) << (memoria_kb / 1024.0)
-                              << std::endl;
-                }
-            }
+    // 2. Obter uso de memória de /proc/[pid]/status
+    std::ifstream status_file("/proc/" + std::to_string(pid) + "/status");
+    std::string line;
+    while (std::getline(status_file, line)) {
+        if (line.rfind("VmRSS:", 0) == 0) {
+            std::istringstream iss(line);
+            std::string key;
+            iss >> key >> p.memoriaKB;
+            break;
         }
     }
 
-    closedir(dir); // Libera os recursos do diretório
-    std::cout << "------------------------------------------------------------------" << std::endl;
-}
-
-// Função para encerrar um processo dado o seu PID
-void encerrarProcesso() {
-    pid_t pid;
-    std::cout << "\nDigite o PID do processo que deseja encerrar: ";
-    std::cin >> pid;
-
-    // Validação de entrada
-    if (std::cin.fail()) {
-        std::cerr << "Entrada invalida. Por favor, digite um numero." << std::endl;
-        std::cin.clear();
-        std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
-        return;
+    // 3. Obter tempo de CPU de /proc/[pid]/stat
+    std::ifstream stat_file("/proc/" + std::to_string(pid) + "/stat");
+    if (stat_file.good()) {
+        std::string value;
+        unsigned long utime = 0, stime = 0;
+        // Os campos de tempo de usuário (utime) e kernel (stime) são o 14º e 15º.
+        for (int i = 1; i < 14; ++i) {
+            stat_file >> value;
+        }
+        stat_file >> utime >> stime; // Lemos os valores de utime e stime
+        
+        // Convertendo de "clock ticks" para segundos
+        long ticks_per_sec = sysconf(_SC_CLK_TCK);
+        p.tempoCPU_s = static_cast<float>(utime + stime) / ticks_per_sec;
     }
 
-    // A chamada de sistema kill() envia um sinal para um processo.
-    // SIGKILL é um sinal que não pode ser ignorado e encerra o processo imediatamente.
+    return p;
+}
+
+std::vector<Processo> listarProcessos() {
+    std::vector<Processo> processos;
+    DIR* dir = opendir("/proc");
+    if (!dir) {
+        std::cerr << "Erro: Não foi possível abrir o diretório /proc." << std::endl;
+        return processos;
+    }
+
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        if (isdigit(entry->d_name[0])) {
+            int pid = std::atoi(entry->d_name);
+            processos.push_back(obterDadosProcesso(pid));
+        }
+    }
+    closedir(dir);
+    return processos;
+}
+
+void exibirProcessos(const std::vector<Processo>& processos) {
+    std::cout << std::left << std::setw(25) << "Nome do Executável"
+              << std::setw(10) << "PID"
+              << std::setw(15) << "Memória (KB)"
+              << std::setw(15) << "Tempo CPU (s)" << std::endl;
+    std::cout << std::string(65, '-') << std::endl;
+
+    for (const auto& p : processos) {
+        if (!p.nome.empty()) {
+            std::cout << std::left << std::setw(25) << p.nome
+                      << std::setw(10) << p.pid
+                      << std::fixed << std::setprecision(2) << std::setw(15) << p.memoriaKB
+                      << std::setw(15) << p.tempoCPU_s
+                      << std::endl;
+        }
+    }
+}
+
+void encerrarProcesso(int pid) {
+    if (kill(pid, SIGTERM) == 0) {
+        std::cout << "Enviando sinal SIGTERM para o processo " << pid << "..." << std::endl;
+        sleep(1); 
+        if (access(("/proc/" + std::to_string(pid)).c_str(), F_OK) != 0) {
+            std::cout << "Processo " << pid << " encerrado com sucesso." << std::endl;
+            return;
+        }
+        std::cout << "Processo " << pid << " não respondeu ao SIGTERM. Tentando SIGKILL..." << std::endl;
+    }
+
     if (kill(pid, SIGKILL) == 0) {
-        std::cout << "Sinal SIGKILL enviado com sucesso para o processo com PID " << pid << "." << std::endl;
+        std::cout << "Processo " << pid << " encerrado com SIGKILL." << std::endl;
     } else {
-        // perror imprime a mensagem de erro do sistema correspondente a `errno`
-        perror("Erro ao enviar o sinal");
-        std::cerr << "Verifique se o PID e valido e se voce tem permissao para encerrar o processo." << std::endl;
+        std::cerr << "Falha ao encerrar processo " << pid << ". Erro: " << strerror(errno) << std::endl;
     }
 }
 
-// Função principal que exibe o menu e gerencia a interação com o usuário
-int main() {
-    int escolha = 0;
+void menu() {
     while (true) {
-        std::cout << "\n===== Monitor de Processos (Linux) =====" << std::endl;
-        std::cout << "1. Listar processos em execucao" << std::endl;
-        std::cout << "2. Encerrar um processo (por PID)" << std::endl;
-        std::cout << "3. Sair" << std::endl;
-        std::cout << "========================================" << std::endl;
-        std::cout << "Escolha uma opcao: ";
-        std::cin >> escolha;
+        std::cout << "\n--- Monitor de Processos ---\n";
+        std::cout << "1. Listar processos em execução\n";
+        std::cout << "2. Encerrar um processo por PID\n";
+        std::cout << "3. Sair\n";
+        std::cout << "Escolha uma opção: ";
+        int opcao;
+        std::cin >> opcao;
 
         if (std::cin.fail()) {
-            std::cerr << "Opcao invalida. Por favor, digite um numero." << std::endl;
+            std::cout << "Opção inválida. Por favor, digite um número.\n";
             std::cin.clear();
-            std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+            std::cin.ignore(10000, '\n');
             continue;
         }
 
-        switch (escolha) {
-            case 1:
-                listarProcessos();
+        switch (opcao) {
+            case 1: {
+                auto processos = listarProcessos();
+                exibirProcessos(processos);
                 break;
-            case 2:
-                encerrarProcesso();
+            }
+            case 2: {
+                std::cout << "Digite o PID do processo a ser encerrado: ";
+                int pid;
+                std::cin >> pid;
+                if (!std::cin.fail()) {
+                    encerrarProcesso(pid);
+                } else {
+                    std::cout << "PID inválido.\n";
+                    std::cin.clear();
+                    std::cin.ignore(10000, '\n');
+                }
                 break;
+            }
             case 3:
-                std::cout << "Saindo do programa..." << std::endl;
-                return 0;
+                std::cout << "Saindo...\n";
+                return;
             default:
-                std::cerr << "Opcao invalida. Tente novamente." << std::endl;
+                std::cout << "Opção inválida. Tente novamente.\n";
                 break;
         }
     }
+}
 
+int main() {
+    menu();
     return 0;
 }
